@@ -26,9 +26,25 @@ print("WEIGHT", cfg.rewards["upright"].weight, "foot_slip" in cfg.rewards)
 """
 
 
-def _run(hook_spec, code):
-    env = {**os.environ, "MICRODUCK_CFG_HOOK": hook_spec}
+def _run(hook_spec, code, env_var="MICRODUCK_CFG_HOOK"):
+    env = {**os.environ, env_var: hook_spec}
     return subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=600)
+
+
+def test_rl_hook_edits_the_agent_cfg_train_loads(tmp_path):
+    hook = tmp_path / "rl_hook.py"
+    hook.write_text(
+        "def apply_agent(task_id, agent_cfg):\n"
+        "    agent_cfg.actor.hidden_dims = (64, 32)\n"
+        "    agent_cfg.algorithm.learning_rate = 3e-4\n")
+    code = (
+        "from mjlab.scripts.train import load_rl_cfg\n"
+        f"cfg = load_rl_cfg({_TASK!r})\n"
+        "print('AGENT', tuple(cfg.actor.hidden_dims), cfg.algorithm.learning_rate)\n"
+    )
+    out = _run(f"{hook}:apply_agent", code, env_var="MICRODUCK_RL_CFG_HOOK")
+    assert out.returncode == 0, out.stderr
+    assert "AGENT (64, 32) 0.0003" in out.stdout
 
 
 def test_hook_edits_the_cfg_train_loads(tmp_path):
