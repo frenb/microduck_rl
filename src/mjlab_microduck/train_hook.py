@@ -33,6 +33,10 @@ _FLAG = "--hf-jobs"
 #: ``uv run train`` must always mean "train locally".
 _IN_JOB_ENV = "MICRODUCK_IN_HF_JOB"
 
+#: ``/path/to/file.py:function`` — called as ``function(task_id, env_cfg, play)``
+#: on every env cfg ``load_env_cfg`` returns, to edit it in place.
+CFG_HOOK_ENV = "MICRODUCK_CFG_HOOK"
+
 
 def _invoked_as_train() -> bool:
     """True when argv[0] is mjlab's trainer (console script or `-m`).
@@ -56,6 +60,54 @@ def maybe_init_checkpoint() -> None:
 
     sys.argv[1:] = consume_init_flag(sys.argv[1:])
     install_init_checkpoint_patch()
+
+
+def maybe_install_cfg_hook() -> None:
+    """Route `load_env_cfg` through `$MICRODUCK_CFG_HOOK`; a no-op when it is unset.
+
+    Lets an orchestrator (e.g. reward designs from rl-roboracer) edit a task's cfg without a
+    fork-side task per variant. Wrapping `load_env_cfg` rather than the registered cfg means the
+    hook sees a fresh copy each time, before tyro's CLI overrides, so `--env.*` flags still win and
+    `params/env.yaml` records the edited cfg. Must run before `mjlab.scripts.train` does
+    `from mjlab.tasks.registry import load_env_cfg`, which is why it lives on this import path.
+
+    A broken hook exits the process: mjlab's plugin loader swallows ordinary exceptions, which
+    would leave every microduck task unregistered and the real error buried in a warning.
+    """
+    spec = os.environ.get(CFG_HOOK_ENV)
+    if not spec:
+        return
+    try:
+        _install_cfg_hook(spec)
+    except Exception as exc:
+        sys.exit(f"{CFG_HOOK_ENV}={spec!r}: {type(exc).__name__}: {exc}")
+
+
+def _install_cfg_hook(spec: str) -> None:
+    import importlib.util
+
+    import mjlab.tasks.registry as registry
+
+    if getattr(registry.load_env_cfg, "_microduck_cfg_hook", None) == spec:
+        return
+    path, sep, func_name = spec.rpartition(":")
+    if not sep or not path or not func_name:
+        raise ValueError(f"{CFG_HOOK_ENV} must be /path/to/file.py:function, got {spec!r}")
+    module_spec = importlib.util.spec_from_file_location("microduck_cfg_hook", path)
+    if module_spec is None or module_spec.loader is None:
+        raise ValueError(f"{CFG_HOOK_ENV}: cannot load {path}")
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    hook = getattr(module, func_name)
+    original = registry.load_env_cfg
+
+    def load_env_cfg(task_name: str, play: bool = False):
+        cfg = original(task_name, play=play)
+        hook(task_name, cfg, play)
+        return cfg
+
+    load_env_cfg._microduck_cfg_hook = spec
+    registry.load_env_cfg = load_env_cfg
 
 
 def maybe_submit_to_hf_jobs() -> None:
